@@ -12,6 +12,7 @@ import tokenization
 import six
 import tensorflow as tf
 from cqa_flags import FLAGS
+from modeling import attention_layer
 
 def bert_rep(bert_config, is_training, input_ids, input_mask, segment_ids, history_answer_marker, use_one_hot_embeddings):
     model = modeling.BertModel(
@@ -301,7 +302,7 @@ def fine_grained_history_attention_net(bert_representation, mtl_input, slice_mas
     token_tensor.set_shape([FLAGS.train_batch_size, FLAGS.max_history_turns, FLAGS.max_seq_length + 1, FLAGS.bert_hidden])
     
     # --> 12 * 385 * 11 * 768
-    token_tensor_t = tf.transpose(token_tensor, [0, 2, 1, 3])
+    token_tensor_t = tf.transpose(token_tensor, [0, 2, 1, 3])# batch*seq_length*history*hidden
     
     if FLAGS.history_attention_hidden:
         hidden = tf.layers.dense(token_tensor_t, 100, activation=tf.nn.relu,
@@ -369,3 +370,123 @@ def fine_grained_history_attention_net(bert_representation, mtl_input, slice_mas
 #     (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
 
 #     return (start_logits, end_logits)
+
+def reshape_to_matrix(input_tensor):
+    ndims = input_tensor.shape.ndims
+    if ndims < 2:
+        raise ValueError("Input tensor must have at least rank 2")
+    if ndims == 2:
+        return input_tensor
+
+    width = input_tensor.shape[-1]
+    output_tensor = tf.reshape(input_tensor, [-1, width])
+    return output_tensor
+
+def self_attention_history_net(bert_representation, mtl_input, slice_mask, slice_num):
+    
+    # first concat the bert_representation and mtl_input togenther
+    # so that we can process them together
+    # shape for bert_representation: 12 * 384 * 768, shape for mtl_input: 12 * 768
+    # after concat: 12 * 385 * 768
+    
+    # 12 * 385 * 768 --> 20 * 385 * 768
+    bert_representation = tf.concat([bert_representation, tf.expand_dims(mtl_input, axis=1)], axis=1)
+    bert_representation = tf.pad(bert_representation, [[0, FLAGS.train_batch_size - slice_num], [0, 0], [0, 0]])
+    splits = tf.split(bert_representation, slice_mask, 0)
+    
+    pad_fn = lambda x, num: tf.pad(x, [[FLAGS.max_history_turns - num, 0], [0, 0], [0, 0]])
+    # padded = tf.map_fn(lambda x: pad_fn(x[0], x[1]), (list(splits), slice_mask), dtype=tf.float32) 
+    padded = []
+    for i in range(FLAGS.train_batch_size):
+        padded.append(pad_fn(splits[i], slice_mask[i]))
+        
+    # --> 12 * 11 * 385 * 768
+    token_tensor = tf.stack(padded, axis=0)
+    token_tensor.set_shape([FLAGS.train_batch_size, FLAGS.max_history_turns, (FLAGS.max_seq_length + 1)* FLAGS.bert_hidden])
+    
+    from_tensor = reshape_to_matrix(token_tensor)
+    to_tensor = reshape_to_matrix(token_tensor)
+
+    query_layer = tf.layers.dense(
+                  from_tensor,
+		  (FLAGS.max_seq_length+1)*FLAGS.bert_hidden,
+		  activation=tf.nn.relu,
+		  name="query",
+		  kernel_initializer=tf.truncated_normal_initializer(stddev=0.02))
+    key_layer = tf.layers.dense(
+                  to_tensor,
+		  (FLAGS.max_seq_length+1)*FLAGS.bert_hidden,
+		  activation=tf.nn.relu,
+		  name="key",
+		  kernel_initializer=tf.truncated_normal_initializer(stddev=0.02))
+    value_layer = tf.layers.dense(
+                  to_tensor,
+		  (FLAGS.max_seq_length+1)*FLAGS.bert_hidden,
+		  activation=tf.nn.relu,
+		  name="value",
+		  kernel_initializer=tf.truncated_normal_initializer(stddev=0.02))
+    
+    def transpose_for_scores(input_tensor, batch_size, max_seq_length+1, history_turns, bert_hidden):
+        output_tensor = tf.reshape(input_tensor,[batch_size, history_turns, max_seq_length+1, bert_hidden])
+
+	output_tensor = tf.transpose(output_tensor, [0,2,1,3])
+	return output_tensor
+    
+    query_layer = transpose_for_scores(query_layer ,FLAGS.train_batch_size, FLAGS.max_seq_length+1,
+                                       FLAGS.max_history_turns, FLAGS.bert_hidden)
+    
+    key_layer = transpose_for_scores(key_layer ,FLAGS.train_batch_size, FLAGS.max_seq_length+1,
+                                       FLAGS.max_history_turns, FLAGS.bert_hidden)
+    
+    attention_scores = tf.matmul(query_layer,key_layer,transpose_b=True)
+
+    attention_scores = tf.multiply(attention_scores,
+                                   1.0/math.sqrt(float(bert_hidden)))
+    
+    attention_probs = tf.nn.softmax(attention_scores) # batch,length,turns,turns
+
+
+    
+    # --> 12 * 385 * 11 * 768
+    token_tensor_t = tf.transpose(token_tensor, [0, 2, 1, 3])# batch*seq_length*history*hidden
+    
+    if FLAGS.history_attention_hidden:
+        hidden = tf.layers.dense(token_tensor_t, 100, activation=tf.nn.relu,
+                kernel_initializer=tf.truncated_normal_initializer(stddev=0.02), name='history_attention_hidden')
+        logits = tf.layers.dense(hidden, 1, activation=None,
+                kernel_initializer=tf.truncated_normal_initializer(stddev=0.02), name='history_attention_model')
+    else:
+        # --> 12 * 385 * 11 * 1
+        logits = tf.layers.dense(token_tensor_t, 1, activation=None,
+                    kernel_initializer=tf.truncated_normal_initializer(stddev=0.02), name='history_attention_model')
+    
+    # --> 12 * 385 * 11
+    logits = tf.squeeze(logits, axis=-1)
+    
+    # mask: 12 * 11 --> after expand_dims: 12 * 1 * 11
+    logits_mask = tf.sequence_mask(slice_mask, FLAGS.max_history_turns, dtype=tf.float32)
+    logits_mask = tf.reverse(logits_mask, axis=[1])
+    logits_mask = tf.expand_dims(logits_mask, axis=1)
+    exp_logits_masked = tf.exp(logits) * logits_mask 
+    
+    # --> e.g. 4 * 385 * 11
+    exp_logits_masked = tf.slice(exp_logits_masked, [0, 0, 0], [slice_num, -1, -1])
+    probs = exp_logits_masked / tf.reduce_sum(exp_logits_masked, axis=2, keepdims=True)
+
+    # --> 4 * 385 * 11 * 768
+    token_tensor_t = tf.slice(token_tensor_t, [0, 0, 0, 0], [slice_num, -1, -1, -1])
+    
+    # 4 * 385 * 11 * 1
+    probs = tf.expand_dims(probs, axis=-1)
+    
+    # 4 * 385 * 768
+    new_bert_representation = tf.reduce_sum(token_tensor_t * probs, axis=2)
+    
+    new_bert_representation.set_shape([None, FLAGS.max_seq_length + 1, FLAGS.bert_hidden])
+    
+    new_bert_representation, new_mtl_input = tf.split(new_bert_representation, [FLAGS.max_seq_length, 1], axis=1)
+    new_mtl_input = tf.squeeze(new_mtl_input, axis=1)
+    
+    return new_bert_representation, new_mtl_input, tf.squeeze(probs)
+
+#
